@@ -529,7 +529,7 @@ var inheritTests = []struct {
 }{{
 	about:       "inherited-from not found",
 	bundle:      `inherits: non-existent`,
-	expectError: `inherited-from bundle "non-existent" not found`,
+	expectError: `cannot get bundle inherited from "root": bundle "non-existent" not found`,
 }, {
 	about:       "bad inheritance #1",
 	bundle:      `inherits: {}`,
@@ -538,93 +538,95 @@ var inheritTests = []struct {
 	about:       "bad inheritance #2",
 	bundle:      `inherits: [{}]`,
 	expectError: `bad inherits clause: got map\[interface \{\}]interface \{\}\{\}, expected string`,
-}, {
-	about:       "bad inheritance #3",
-	bundle:      `inherits: ['a', 'b']`,
-	expectError: `multiple inheritance not supported`,
-}, {
-	about: "inherit everything",
-	bundle: `
+},
+	//, {
+	//	about:       "bad inheritance #3",
+	//	bundle:      `inherits: ['a', 'b']`,
+	//	expectError: `multiple inheritance not supported`,
+	//},
+	{
+		about: "inherit everything",
+		bundle: `
 		|inherits: base
 	`,
-	baseName: "base",
-	base: `
+		baseName: "base",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-	expect: `
+		expect: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-}, {
-	about: "inherit everything, specified as list",
-	bundle: `
+	}, {
+		about: "inherit everything, specified as list",
+		bundle: `
 		|inherits: [base]
 	`,
-	baseName: "base",
-	base: `
+		baseName: "base",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-	expect: `
+		expect: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-}, {
-	about: "different base name",
-	bundle: `
+	}, {
+		about: "different base name",
+		bundle: `
 		|inherits: something
 	`,
-	baseName: "something",
-	base: `
+		baseName: "something",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-	expect: `
+		expect: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-}, {
-	about: "override series",
-	bundle: `
+	}, {
+		about: "override series",
+		bundle: `
 		|inherits: base
 		|series: trusty
 	`,
-	baseName: "base",
-	base: `
+		baseName: "base",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-	expect: `
+		expect: `
 		|series: trusty
 		|services:
 		|    wordpress:
 		|        charm: 'cs:precise/wordpress'
 	`,
-}, {
-	about: "override wordpress charm",
-	bundle: `
+	}, {
+		about: "override wordpress charm",
+		bundle: `
 		|inherits: base
 		|services:
 		|    wordpress:
 		|        charm: 'cs:quantal/different'
 	`,
-	baseName: "base",
-	base: `
+		baseName: "base",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
@@ -632,7 +634,7 @@ var inheritTests = []struct {
 		|        options:
 		|            foo: bar
 	`,
-	expect: `
+		expect: `
 		|series: precise
 		|services:
 		|    wordpress:
@@ -640,16 +642,16 @@ var inheritTests = []struct {
 		|        options:
 		|            foo: bar
 	`,
-}, {
-	about: "override to clause",
-	bundle: `
+	}, {
+		about: "override to clause",
+		bundle: `
 		|inherits: base
 		|services:
 		|    wordpress:
 		|        to: 0
 	`,
-	baseName: "base",
-	base: `
+		baseName: "base",
+		base: `
 		|series: precise
 		|services:
 		|    wordpress:
@@ -657,7 +659,7 @@ var inheritTests = []struct {
 		|        options:
 		|            foo: bar
 	`,
-	expect: `
+		expect: `
 		|series: precise
 		|services:
 		|    wordpress:
@@ -666,17 +668,19 @@ var inheritTests = []struct {
 		|            foo: bar
 		|        to: 0
 	`,
-}, {
-	about: "deep inheritance",
-	bundle: `
-		|inherits: base
-	`,
-	baseName: "base",
-	base: `
-		|inherits: "other"
-	`,
-	expectError: `only a single level of inheritance is supported`,
-}}
+	},
+	//, {
+	//	about: "deep inheritance",
+	//	bundle: `
+	//		|inherits: base
+	//	`,
+	//	baseName: "base",
+	//	base: `
+	//		|inherits: "other"
+	//	`,
+	//	expectError: `only a single level of inheritance is supported`,
+	//},
+}
 
 var otherBundle = parseBundle(`
 	|series: quantal
@@ -684,7 +688,7 @@ var otherBundle = parseBundle(`
 	|  something: other
 `)
 
-func (*migrateSuite) TestInherit(c *gc.C) {
+func (*migrateSuite) TestGetBundle(c *gc.C) {
 	for i, test := range inheritTests {
 		c.Logf("test %d: %s", i, test.about)
 		bundle := parseBundle(test.bundle)
@@ -692,10 +696,11 @@ func (*migrateSuite) TestInherit(c *gc.C) {
 		expect := parseBundle(test.expect)
 		// Add another bundle so we know that is
 		bundles := map[string]*legacyBundle{
+			"root":        bundle,
 			test.baseName: base,
 			"other":       otherBundle,
 		}
-		b, err := inherit(bundle, bundles)
+		b, err := getBundle(bundles, "root")
 		if test.expectError != "" {
 			c.Check(err, gc.ErrorMatches, test.expectError)
 		} else {

@@ -68,8 +68,8 @@ func Migrate(bundlesYAML []byte, isSubordinate func(id *charm.Reference) (bool, 
 	}
 	// First expand any inherits clauses.
 	newBundles := make(map[string]*charm.BundleData)
-	for name, bundle := range bundles {
-		bundle, err := inherit(bundle, bundles)
+	for name := range bundles {
+		bundle, err := getBundle(bundles, name)
 		if err != nil {
 			return nil, errgo.Notef(err, "bundle inheritance failed for %q", name)
 		}
@@ -184,12 +184,24 @@ func expandRelations(relations []interface{}) ([][]string, error) {
 	return newRelations, nil
 }
 
-// inherit adds any inherited attributes to the given bundle b. It does
-// not modify b, returning a new bundle if necessary.
-//
-// The bundles map holds all the bundles from the basket (the possible
-// bundles that can be inherited from).
-func inherit(b *legacyBundle, bundles map[string]*legacyBundle) (*legacyBundle, error) {
+// getBunde returns the bundle with the given name from bundles,
+// applying any inheritance necessary to fully resolve it.
+func getBundle(bundles map[string]*legacyBundle, name string) (*legacyBundle, error) {
+	return getBundle0(bundles, name, make(map[string]bool))
+}
+
+func getBundle0(bundles map[string]*legacyBundle, name string, visit map[string]bool) (*legacyBundle, error) {
+	if visit[name] {
+		return nil, errgo.Newf("infinite loop found in inheritance graph")
+	}
+	visit[name] = true
+	defer func() {
+		visit[name] = false
+	}()
+	b := bundles[name]
+	if b == nil {
+		return nil, errgo.Newf("bundle %q not found", name)
+	}
 	if b.Inherits == nil {
 		return b, nil
 	}
@@ -200,30 +212,29 @@ func inherit(b *legacyBundle, bundles map[string]*legacyBundle) (*legacyBundle, 
 	if len(inheritsList) == 0 {
 		return b, nil
 	}
-	if len(inheritsList) > 1 {
-		return nil, errgo.Newf("multiple inheritance not supported")
-	}
-	inherits := inheritsList[0]
-	from := bundles[inherits]
-	if from == nil {
-		return nil, errgo.Newf("inherited-from bundle %q not found", inherits)
-	}
-	if from.Inherits != nil {
-		return nil, errgo.Newf("only a single level of inheritance is supported")
-	}
-	// Make a generic copy of both the base and target bundles,
-	// so we can apply inheritance regardless of Go types.
-	var target map[interface{}]interface{}
-	err = yamlCopy(&target, from)
-	if err != nil {
-		return nil, errgo.Notef(err, "copy target")
+	target := make(map[interface{}]interface{})
+	// Add each inherited bundle in turn, then finally
+	// add the bundle itself.
+	for _, inherits := range inheritsList {
+		inheritb, err := getBundle(bundles, inherits)
+		if err != nil {
+			return nil, errgo.Newf("cannot get bundle inherited from %q: %v", name, err)
+		}
+		// Make a vanilla copy of the source so that
+		// we can copy all attributes regardless of type.
+		var source map[interface{}]interface{}
+		err = yamlCopy(&source, inheritb)
+		if err != nil {
+			return nil, errgo.Notef(err, "copy source")
+		}
+		// Apply the inherited attributes.
+		copyOnto(target, source, true)
 	}
 	var source map[interface{}]interface{}
 	err = yamlCopy(&source, b)
 	if err != nil {
 		return nil, errgo.Notef(err, "copy source")
 	}
-	// Apply the inherited attributes.
 	copyOnto(target, source, true)
 
 	// Convert back to Go types.
