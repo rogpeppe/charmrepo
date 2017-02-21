@@ -14,6 +14,7 @@ package csclient
 
 import (
 	"bytes"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"gopkg.in/errgo.v1"
@@ -35,6 +37,8 @@ import (
 )
 
 const apiVersion = "v5"
+
+var minMultipartUploadSize int64 = 5 * 1024 * 1024
 
 // ServerURL holds the default location of the global charm store.
 // An alternate location can be configured by changing the URL field in the
@@ -228,17 +232,54 @@ func (c *Client) ListResources(id *charm.URL) ([]params.Resource, error) {
 	return result, nil
 }
 
-// UploadResource uploads the bytes for a resource.
-func (c *Client) UploadResource(id *charm.URL, name, path string, file io.ReadSeeker) (revision int, err error) {
-	hash, size, err := readerHashAndSize(file)
+// Progress lets an upload notify a caller about the progress of the upload.
+type Progress interface {
+	// Start is called with the size of the upload and its upload id
+	// when the upload starts. The uploadId will be empty when
+	// the upload is small and multipart upload is not being used.
+	Start(uploadId string, expires time.Time)
+
+	// Transferred is called periodically to notify the caller that
+	// the given number of bytes have been uploaded.
+	Transferred(total int64)
+
+	// Error is called when a non-fatal error has been encountered
+	// when uploading.
+	Error(err error)
+
+	// Finalizing is called when all the parts of a multipart upload
+	// are being stitched together into the final resource.
+	Finalizing()
+}
+
+// UploadResource uploads the contents of a resource of the given name
+// attached to a charm with the given id. The given path will be used as
+// the resource path metadata and the contents will be read from the
+// given file, which must have the given size. If progress is not nil, it will
+// be called to inform the caller of the progress of the upload.
+func (c *Client) UploadResource(id *charm.URL, name, path string, file io.ReaderAt, size int64, progress Progress) (revision int, err error) {
+	if progress == nil {
+		progress = noProgress{}
+	}
+	if size >= minMultipartUploadSize {
+		return c.uploadMultipartResource(id, name, path, file, size, progress)
+	}
+	return c.uploadSinglePartResource(id, name, path, file, size, progress)
+}
+
+func (c *Client) uploadSinglePartResource(id *charm.URL, name, path string, file io.ReaderAt, size int64, progress Progress) (revision int, err error) {
+	progress.Start("", time.Time{})
+	hash, size1, err := readerHashAndSize(io.NewSectionReader(file, 0, size))
 	if err != nil {
 		return -1, errgo.Mask(err)
 	}
-
+	if size1 != size {
+		return 0, errgo.Newf("resource file changed underfoot? (initial size %d, then %d)", size, size1)
+	}
 	// Prepare the request.
 	req, err := http.NewRequest("POST", "", nil)
 	if err != nil {
-		return -1, errgo.Notef(err, "cannot make new request")
+		return 0, errgo.Notef(err, "cannot make new request")
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = size
@@ -249,23 +290,114 @@ func (c *Client) UploadResource(id *charm.URL, name, path string, file io.ReadSe
 	url := fmt.Sprintf("/%s/resource/%s?hash=%s&filename=%s", id.Path(), name, hash, path)
 
 	// Send the request.
-	resp, err := c.DoWithBody(req, url, file)
+	resp, err := c.DoWithBody(req, url, io.NewSectionReader(file, 0, size))
 	if err != nil {
-		return -1, errgo.NoteMask(err, "cannot post resource", isAPIError)
+		return 0, errgo.NoteMask(err, "cannot post resource", isAPIError)
 	}
 	defer resp.Body.Close()
 
 	// Parse the response.
 	var result params.ResourceUploadResponse
 	if err := parseResponseBody(resp.Body, &result); err != nil {
-		return -1, errgo.Mask(err)
+		return 0, errgo.Mask(err)
 	}
 	return result.Revision, nil
 }
 
+func (c *Client) uploadMultipartResource(id *charm.URL, name, path string, file io.ReaderAt, size int64, progress Progress) (revision int, err error) {
+	// Create the upload.
+	var resp params.NewUploadResponse
+	if err := c.doWithResponse("POST", "/upload", nil, &resp); err != nil {
+		if errgo.Cause(err) == params.ErrNotFound {
+			// An earlier version of the API - try single part upload even though it's big.
+			return c.uploadSinglePartResource(id, name, path, file, size, progress)
+		}
+		return 0, errgo.Mask(err)
+	}
+	uploadId := resp.UploadId
+	progress.Start(uploadId, resp.Expires)
+	// Calculate the part size, but round up so that we have
+	// enough parts to cover the remainder at the end.
+	partSize := (size + int64(resp.MaxParts) - 1) / int64(resp.MaxParts)
+	if partSize > resp.MaxPartSize {
+		return 0, errgo.Newf("resource too big (allowed %.3fGB)", float64(resp.MaxPartSize)*float64(resp.MaxParts)/1e9)
+	}
+	if partSize < resp.MinPartSize {
+		partSize = resp.MinPartSize
+	}
+	var parts params.Parts
+	for i, p0 := 0, int64(0); ; i, p0 = i+1, p0+partSize {
+		p1 := p0 + partSize
+		if p1 > size {
+			p1 = size
+		}
+		// TODO concurrent part upload?
+		hash, err := c.uploadPart(uploadId, i, file, p0, p1, progress)
+		if err != nil {
+			return 0, errgo.Mask(err)
+		}
+		parts.Parts = append(parts.Parts, params.Part{
+			Hash: hash,
+		})
+		if p1 >= size {
+			break
+		}
+	}
+	progress.Finalizing()
+	// All parts uploaded, now complete the upload.
+	var finishResponse params.FinishUploadResponse
+	if err := c.PutWithResponse("/upload/"+uploadId, parts, &finishResponse); err != nil {
+		return 0, errgo.Mask(err)
+	}
+	url := fmt.Sprintf("/%s/resource/%s?upload-id=%s&filename=%s", id.Path(), name, uploadId, path)
+
+	// The multipart upload has now been uploaded.
+	// Create the resource that uses it.
+	var resourceResp params.ResourceUploadResponse
+	if err := c.doWithResponse("POST", url, nil, &resourceResp); err != nil {
+		return -1, errgo.NoteMask(err, "cannot post resource", isAPIError)
+	}
+	return resourceResp.Revision, nil
+}
+
+// uploadPart uploads a single part of a multipart upload
+// and returns the hash of the part.
+func (c *Client) uploadPart(uploadId string, part int, r io.ReaderAt, p0, p1 int64, progress Progress) (string, error) {
+	h := sha512.New384()
+	if _, err := io.Copy(h, io.NewSectionReader(r, p0, p1-p0)); err != nil {
+		return "", errgo.Notef(err, "cannot read resource")
+	}
+	hash := fmt.Sprintf("%x", h.Sum(nil))
+	var lastError error
+	for i := 0; i < 10; i++ {
+		req, err := http.NewRequest("PUT", "", nil)
+		if err != nil {
+			return "", errgo.Mask(err)
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.ContentLength = p1 - p0
+		section := io.NewSectionReader(r, p0, p1-p0)
+		resp, err := c.DoWithBody(req, fmt.Sprintf("/upload/%s/%d?hash=%s", uploadId, part, hash), section)
+		if err == nil {
+			// Success
+			resp.Body.Close()
+			return hash, nil
+		}
+		if isAPIError(err) {
+			// It's a genuine error from the charm store, so
+			// stop trying.
+			return "", errgo.Mask(err, isAPIError)
+		}
+		progress.Error(err)
+		lastError = err
+		// Try again.
+	}
+	return "", errgo.Notef(lastError, "too many attempts; last error")
+}
+
 // Publish tells the charmstore to mark the given charm as published with the
 // given resource revisions to the given channels.
-func (s *Client) Publish(id *charm.URL, channels []params.Channel, resources map[string]int) error {
+func (c *Client) Publish(id *charm.URL, channels []params.Channel, resources map[string]int) error {
 	if len(channels) == 0 {
 		return nil
 	}
@@ -273,7 +405,7 @@ func (s *Client) Publish(id *charm.URL, channels []params.Channel, resources map
 		Resources: resources,
 		Channels:  channels,
 	}
-	if err := s.Put("/"+id.Path()+"/publish", val); err != nil {
+	if err := c.Put("/"+id.Path()+"/publish", val); err != nil {
 		return errgo.Mask(err, isAPIError)
 	}
 	return nil
@@ -664,7 +796,11 @@ func (c *Client) Put(path string, val interface{}) error {
 // should be a pointer to the expected data, but may be nil if no result is
 // desired.
 func (c *Client) PutWithResponse(path string, val, result interface{}) error {
-	req, _ := http.NewRequest("PUT", "", nil)
+	return c.doWithResponse("PUT", path, val, result)
+}
+
+func (c *Client) doWithResponse(method string, path string, val, result interface{}) error {
+	req, _ := http.NewRequest(method, "", nil)
 	req.Header.Set("Content-Type", "application/json")
 	data, err := json.Marshal(val)
 	if err != nil {
@@ -921,3 +1057,14 @@ func isAPIError(err error) bool {
 	}
 	return IsAuthorizationError(err)
 }
+
+// noProgress implements Progress by doing nothing.
+type noProgress struct{}
+
+func (noProgress) Start(uploadId string, expires time.Time) {}
+
+func (noProgress) Transferred(total int64) {}
+
+func (noProgress) Error(err error) {}
+
+func (noProgress) Finalizing() {}
