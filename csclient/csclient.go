@@ -234,17 +234,17 @@ func (c *Client) ListResources(id *charm.URL) ([]params.Resource, error) {
 
 // Progress lets an upload notify a caller about the progress of the upload.
 type Progress interface {
-	// Start is called with the size of the upload and its upload id
-	// when the upload starts. The uploadId will be empty when
-	// the upload is small and multipart upload is not being used.
+	// Start is called with the its upload id and when the upload
+	// starts. The uploadId will be empty when the upload is small
+	// and multipart upload is not being used.
 	Start(uploadId string, expires time.Time)
 
 	// Transferred is called periodically to notify the caller that
 	// the given number of bytes have been uploaded.
 	Transferred(total int64)
 
-	// Error is called when a non-fatal error has been encountered
-	// when uploading.
+	// Error is called when a non-fatal error (any non api error) has
+	// been encountered when uploading.
 	Error(err error)
 
 	// Finalizing is called when all the parts of a multipart upload
@@ -301,6 +301,7 @@ func (c *Client) uploadSinglePartResource(id *charm.URL, name, path string, file
 	if err := parseResponseBody(resp.Body, &result); err != nil {
 		return 0, errgo.Mask(err)
 	}
+	progress.Finalizing()
 	return result.Revision, nil
 }
 
@@ -360,6 +361,38 @@ func (c *Client) uploadMultipartResource(id *charm.URL, name, path string, file 
 	return resourceResp.Revision, nil
 }
 
+type progressReader struct {
+	r     io.ReadSeeker
+	p     Progress
+	pos   int64
+	start int64
+}
+
+func newProgressReader(r io.ReadSeeker, p Progress, start int64) io.ReadSeeker {
+	return &progressReader{
+		r:     r,
+		p:     p,
+		pos:   start,
+		start: start,
+	}
+}
+
+func (p *progressReader) Read(pb []byte) (int, error) {
+	n, err := p.r.Read(pb)
+	if n > 0 {
+		p.pos += int64(n)
+		p.p.Transferred(p.pos)
+	}
+	return n, err
+}
+
+func (p *progressReader) Seek(offset int64, whence int) (int64, error) {
+	pos, err := p.r.Seek(offset, whence)
+	p.pos = p.start + pos
+	p.p.Transferred(p.pos)
+	return pos, err
+}
+
 // uploadPart uploads a single part of a multipart upload
 // and returns the hash of the part.
 func (c *Client) uploadPart(uploadId string, part int, r io.ReaderAt, p0, p1 int64, progress Progress) (string, error) {
@@ -369,6 +402,7 @@ func (c *Client) uploadPart(uploadId string, part int, r io.ReaderAt, p0, p1 int
 	}
 	hash := fmt.Sprintf("%x", h.Sum(nil))
 	var lastError error
+	section := newProgressReader(io.NewSectionReader(r, p0, p1-p0), progress, p0)
 	for i := 0; i < 10; i++ {
 		req, err := http.NewRequest("PUT", "", nil)
 		if err != nil {
@@ -376,7 +410,6 @@ func (c *Client) uploadPart(uploadId string, part int, r io.ReaderAt, p0, p1 int
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.ContentLength = p1 - p0
-		section := io.NewSectionReader(r, p0, p1-p0)
 		resp, err := c.DoWithBody(req, fmt.Sprintf("/upload/%s/%d?hash=%s", uploadId, part, hash), section)
 		if err == nil {
 			// Success
@@ -390,6 +423,7 @@ func (c *Client) uploadPart(uploadId string, part int, r io.ReaderAt, p0, p1 int
 		}
 		progress.Error(err)
 		lastError = err
+		section.Seek(0, 0)
 		// Try again.
 	}
 	return "", errgo.Notef(lastError, "too many attempts; last error")
@@ -879,6 +913,13 @@ func (c *Client) DoWithBody(req *http.Request, path string, body io.ReadSeeker) 
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errgo.Notef(err, "cannot read response body")
+	}
+
+	fmt.Printf("Header: %#v\n", resp.Header)
+
+
+	if resp.Header.Get("Content-Type") != "application/json" {
+		return nil, errgo.Newf("unexpected response status from server: %v", resp.Status)
 	}
 	var perr params.Error
 	if err := json.Unmarshal(data, &perr); err != nil {
