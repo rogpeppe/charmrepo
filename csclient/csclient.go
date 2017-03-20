@@ -332,7 +332,26 @@ func (c *Client) uploadMultipartResource(id *charm.URL, name, path string, file 
 		partSize = resp.MinPartSize
 	}
 	var parts params.Parts
-	for i, p0 := 0, int64(0); ; i, p0 = i+1, p0+partSize {
+	var p1 int64
+	for i, p0 := 0, int64(0); ; i, p0 = i+1, p1 {
+		p1 = p0 + partSize
+		if i < len(parts.Parts) {
+			// There's possibly an already-uploaded part here.
+			
+			switch part := &parts.Parts[i]; {
+			case part.Complete:
+				continue
+			case part.Size > 0:
+				p1 = p0 + part.Size
+			default:
+				p1 = p0 + partSize
+				if i+1 < len(parts.Parts) && p1 > 
+				if 
+			}
+		} else {
+			parts = append(parts.Parts, params.Part{
+				Size: 
+	
 		p1 := p0 + partSize
 		if p1 > size {
 			p1 = size
@@ -344,6 +363,7 @@ func (c *Client) uploadMultipartResource(id *charm.URL, name, path string, file 
 		}
 		parts.Parts = append(parts.Parts, params.Part{
 			Hash: hash,
+			Size: currentPartSize,
 		})
 		if p1 >= size {
 			break
