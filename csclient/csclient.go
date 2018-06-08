@@ -253,7 +253,7 @@ func (c *Client) UploadResource(id *charm.URL, name, path string, file io.Reader
 //
 // AddDockerResource returns the revision of the newly added resource.
 func (c *Client) AddDockerResource(id *charm.URL, resourceName string, imageName, digest string) (revision int, err error) {
-	path := fmt.Sprintf("%s/resource/%s", id.Path(), resourceName)
+	path := fmt.Sprintf("/%s/resource/%s", id.Path(), resourceName)
 	var result params.ResourceUploadResponse
 	if err := c.DoWithResponse("POST", path, params.DockerResourceUploadRequest{
 		Digest:    digest,
@@ -269,7 +269,7 @@ func (c *Client) AddDockerResource(id *charm.URL, resourceName string, imageName
 // The returned information includes a tag to associated with the image
 // and username and password to use for push authentication.
 func (c *Client) DockerResourceUploadInfo(id *charm.URL, resourceName string) (*params.DockerInfoResponse, error) {
-	path := fmt.Sprintf("%s/docker-resource-upload-info?resourceName=%s", id.Path(), url.QueryEscape(resourceName))
+	path := fmt.Sprintf("/%s/docker-resource-upload-info?resource-name=%s", id.Path(), url.QueryEscape(resourceName))
 	var result params.DockerInfoResponse
 	if err := c.DoWithResponse("GET", path, nil, &result); err != nil {
 		return nil, errgo.Mask(err)
